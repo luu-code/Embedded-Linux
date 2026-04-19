@@ -123,7 +123,26 @@ int main() {
     while(frame_count < max_frames)
     {
         // step7 --- 从缓冲区取出一帧图像
-        poll(poll_fds, 1, 5000);
+        int poll_ret = poll(poll_fds, 1, 5000);
+        
+        // 检查poll返回值
+        if (poll_ret < 0) {
+            // poll出错
+            perror("Poll error");
+            goto cleanup;
+        } else if (poll_ret == 0) {
+            // 超时，设备未准备好
+            fprintf(stderr, "Poll timeout after 5 seconds, no data available\n");
+            // 可以选择继续等待或退出
+            // continue;  // 继续尝试下一帧
+            goto cleanup;  // 或者退出程序
+        }
+        
+        // 检查是否有数据可读
+        if (!(poll_fds[0].revents & POLLIN)) {
+            fprintf(stderr, "Unexpected poll revents: %d\n", poll_fds[0].revents);
+            goto cleanup;
+        }
         
         struct v4l2_buffer buf;
         memset(&buf, 0, sizeof(buf));
