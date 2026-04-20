@@ -70,7 +70,7 @@ int main() {
     
     // step5 --- 内存映射
     // 查询前面申请的内核层存放设备数据的buf是否成功
-    for (int i = 0; i < buf_req.count; i++) {
+    for (unsigned int i = 0; i < buf_req.count; i++) {
         struct v4l2_buffer buf;
         memset(&buf, 0, sizeof(buf));
         buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
@@ -94,7 +94,7 @@ int main() {
     }
 
     // step6 --- 为申请的内核层buf申请消息队列，并开始流处理
-    for (int i = 0; i < buf_req.count; ++i) {
+    for (unsigned int i = 0; i < buf_req.count; ++i) {
         struct v4l2_buffer buf;
         memset(&buf, 0, sizeof(buf));
         buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
