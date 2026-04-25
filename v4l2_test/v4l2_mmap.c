@@ -1,4 +1,4 @@
-/* v4l2_sample.c 是一个最简单的v4l2程序 */
+/* v4l2_mmap.c - MMAP方式的V4L2示例程序 */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
