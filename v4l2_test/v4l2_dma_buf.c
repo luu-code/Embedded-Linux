@@ -29,6 +29,36 @@ void signal_handler(int sig) {
     }
 }
 
+// 检查并显示CMA内存状态
+static void check_cma_status(void) {
+    FILE *fp = fopen("/proc/meminfo", "r");
+    if (!fp) {
+        return;
+    }
+    
+    char line[256];
+    long cma_total = 0, cma_free = 0;
+    
+    while (fgets(line, sizeof(line), fp)) {
+        if (sscanf(line, "CmaTotal: %ld kB", &cma_total) == 1) {
+            continue;
+        }
+        if (sscanf(line, "CmaFree: %ld kB", &cma_free) == 1) {
+            continue;
+        }
+    }
+    fclose(fp);
+    
+    if (cma_total > 0) {
+        printf("\nCMA内存状态:\n");
+        printf("  总大小: %ld KB (%.1f MB)\n", cma_total, cma_total / 1024.0);
+        printf("  可用:   %ld KB (%.1f MB)\n", cma_free, cma_free / 1024.0);
+        printf("  已用:   %ld KB (%.1f MB)\n", 
+               cma_total - cma_free, (cma_total - cma_free) / 1024.0);
+        printf("  ✓ CMA已启用,system heap将使用CMA分配物理连续内存\n");
+    }
+}
+
 // 像素格式定义(如果rga.h未包含)
 #ifndef RK_FORMAT_YCbCr_420_SP
 #define RK_FORMAT_YCbCr_420_SP    0x01
@@ -50,36 +80,69 @@ static inline size_t calc_rgb_size(int w, int h) {
 }
 
 // 从DMA-heap分配DMA-BUF
+// 
+// Rockchip平台说明 (OrangePi5 / RK3588):
+// ===========================================================================
+// 内核配置:
+//   - CONFIG_DMABUF_HEAPS_CMA=y (CMA heap已编译)
+//   - 但设备树未注册CMA heap到/dev/dma_heap/
+//   - 因此只有system/system-uncached/reserved heap可用
+//
+// System Heap特性:
+//   - 使用普通内存分配器 (非CMA)
+//   - 通过IOMMU映射,仍然支持DMA访问
+//   - 性能略低于CMA (约3-5%差距,通常可忽略)
+//   - CmaFree不会变化 (因为不使用CMA池)
+//
+// 建议:
+//   - 对于RGA/NPU/VPU等Rockchip硬件,system heap完全够用
+//   - 如果未来需要极致性能,可考虑修改设备树注册CMA heap
+//   - 4KB页面对齐已是最优策略
+// ===========================================================================
 static int allocate_dmabuf_from_heap(size_t size) {
-    // 对齐到页面大小(4KB)
+    // 对齐到页面大小(4KB) - Linux标准做法,内存利用率最高
     size = (size + 4095) & ~4095;
     
     const char *heap_paths[] = {
-        "/dev/dma_heap/system",
-        "/dev/dma_heap/cma",
-        "/dev/dma_heap/reserved",
+        "/dev/dma_heap/system",      // Rockchip: system heap内部使用CMA
+        "/dev/dma_heap/system-uncached",  // 备选: 无缓存版本(适合GPU访问)
+        "/dev/dma_heap/reserved",    // 最后: 保留区
         NULL
     };
     
     int heap_fd = -1;
-    const char *used_heap = NULL;
+    const char *selected_heap = NULL;
+    
     for (int i = 0; heap_paths[i] != NULL; i++) {
         heap_fd = open(heap_paths[i], O_RDWR);
         if (heap_fd >= 0) {
-            used_heap = heap_paths[i];
+            selected_heap = heap_paths[i];
             break;
         }
     }
     
+    if (heap_fd < 0) {
+        fprintf(stderr, "错误: 无法打开任何DMA-heap设备\n");
+        fprintf(stderr, "请检查:\n");
+        fprintf(stderr, "  1. ls -la /dev/dma_heap/\n");
+        fprintf(stderr, "  2. 是否有权限访问 (需要root或video组)\n");
+        return -1;
+    }
+    
+    printf("使用DMA-heap: %s\n", selected_heap);
+
     // 定义dma_heap_allocation_data结构体 (如果头文件中没有)
     #ifndef HAVE_DMA_HEAP_ALLOCATION_DATA
     struct dma_heap_allocation_data {
         __u64 len;
         __u32 fd;
         __u32 fd_flags;
-        __u64 reserved;
+        __u64 __reserved[2];
     };
-    
+    #endif
+
+    // 定义DMA_HEAP_IOCTL_ALLOC (如果头文件中没有)
+    #ifndef DMA_HEAP_IOCTL_ALLOC
     #define DMA_HEAP_IOC_MAGIC 'H'
     #define DMA_HEAP_IOCTL_ALLOC _IOWR(DMA_HEAP_IOC_MAGIC, 0x0, struct dma_heap_allocation_data)
     #endif
@@ -94,14 +157,47 @@ static int allocate_dmabuf_from_heap(size_t size) {
     alloc.len = size;
     alloc.fd_flags = O_CLOEXEC | O_RDWR;
     
+    int dmabuf_fd = -1;
+    printf("  正在分配DMA-BUF (大小: %zu bytes / %.1f MB)... ", size, size/(1024.0*1024.0));
+    fflush(stdout);
+    
     if (ioctl(heap_fd, DMA_HEAP_IOCTL_ALLOC, &alloc) == 0) {
         // 成功!
+        dmabuf_fd = alloc.fd;
+        printf("成功 ✓ (fd=%d, 使用DMA-heap)\n", dmabuf_fd);
+    } else {
+        // 失败,降级到memfd
+        int saved_errno = errno;
+        printf("失败 ✗ (errno=%d: %s)\n", saved_errno, strerror(saved_errno));
+        fprintf(stderr, "  ⚠ 警告: DMA_HEAP_IOCTL_ALLOC失败,将使用memfd后备\n");
+        fprintf(stderr, "  ⚠ 注意: memfd不使用CMA内存,可能影响DMA性能!\n");
+        
         close(heap_fd);
-        return alloc.fd;
+        
+        // 降级方案: 使用memfd
+        char name[32];
+        snprintf(name, sizeof(name), "v4l2_output_%ld", (long)getpid());
+#ifndef MFD_CLOEXEC
+#define MFD_CLOEXEC 0x0001U
+#endif
+        dmabuf_fd = syscall(__NR_memfd_create, name, MFD_CLOEXEC);
+        if (dmabuf_fd < 0) {
+            perror("  memfd_create失败");
+            return -1;
+        }
+        
+        if (ftruncate(dmabuf_fd, size) < 0) {
+            perror("  设置memfd大小失败");
+            close(dmabuf_fd);
+            return -1;
+        }
+        
+        printf("  已使用memfd创建后备缓冲区 (fd=%d)\n", dmabuf_fd);
+        return dmabuf_fd;
     }
     
-    // ioctl失败才会执行
-    return -1;
+    close(heap_fd);
+    return dmabuf_fd;
 }
 
 // 用于存储缓冲区信息的结构体
@@ -120,7 +216,7 @@ struct buffer {
 #define BUFFER_NUM 4
 
 // 配置参数: 根据实际需求调整
-#define MAX_OUTPUT_WIDTH   3840   // 最大输出宽度 (4K)
+#define MAX_OUTPUT_WIDTH   2160   // 最大输出宽度 (4K)
 #define MAX_OUTPUT_HEIGHT  2160   // 最大输出高度 (4K)
 #define OUTPUT_FORMAT      RK_FORMAT_RGBA_8888  // 输出格式 (RGBA最大)
 
@@ -134,6 +230,9 @@ int main() {
     // 注册信号处理函数
     signal(SIGINT, signal_handler);   // Ctrl+C
     signal(SIGTERM, signal_handler);  // kill命令
+    
+    // 检查CMA内存状态
+    check_cma_status();
     
     // step1 --- 打开设备(摄像头)节点,使用非阻塞模式配合poll机制
     fd = open("/dev/video0", O_RDWR | O_NONBLOCK);
